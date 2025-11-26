@@ -1,101 +1,93 @@
-import pickle
-import numpy as np
+import pandas as pd
+from fastapi import FastAPI, Request, Query
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
+from src.prophet_loader import load_model
+import uvicorn
 import os
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Any # 타입 힌트를 위해 Any를 추가했습니다.
 
-# ----------------------------------------------------
 # 1. FastAPI 앱 생성
-# ----------------------------------------------------
-app = FastAPI(
-    title="Titanic Survival Prediction API",
-    description="머신러닝 예측 서비스 예제"
-)
+app = FastAPI(title="온도 예측 시스템")
 
-# ----------------------------------------------------
-# 2. Pydantic 모델 정의
-# ----------------------------------------------------
-# 클라이언트로부터 받을 입력 데이터의 형태를 정의
-class PredictionInput(BaseModel):
-    sex: str # male 또는 female
-    age: float
+# 2. 템플릿 설정 (HTML 파일 경로)
+templates = Jinja2Templates(directory="templates")
 
-# ----------------------------------------------------
-# 3. 모델 로드 (서버 시작 시 한 번만 실행)
-# ----------------------------------------------------
-MODEL_PATH = "titanic_model.pkl"
-model: Any = None
-label_encoder: Any = None
+# 3. 모델 로드 (서버 시작 시 1회 로드)
+model, forecast = load_model()
 
-if not os.path.exists(MODEL_PATH):
-    # 모델 파일이 없으면 서버 시작 불가
-    # 실제 강의에서는 이전에 train_model.py를 실행해야 함을 강조
-    raise FileNotFoundError(f"모델 파일이 존재하지 않습니다: {MODEL_PATH}")
+# 예측 가능한 날짜 목록 및 데이터 범위 설정
+available_dates = forecast["ds"].dt.date.astype(str).tolist()
+actual_data_last_date = pd.to_datetime("2025-02-28")
+min_date, max_date = forecast["ds"].min(), forecast["ds"].max()
 
-try:
-    with open(MODEL_PATH, "rb") as f:
-        # pickle 파일에서 모델과 레이블 인코더 로드
-        model, label_encoder = pickle.load(f)
-    print(f"모델 로드 완료 및 준비됨.")
-except Exception as e:
-    raise RuntimeError(f"모델 로드 중 오류 발생: {e}")
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    """메인 페이지 렌더링"""
+    return templates.TemplateResponse(
+        "index.html", 
+        {"request": request, "available_dates": available_dates}
+    )
 
-
-# ----------------------------------------------------
-# 4. API 엔드포인트 정의 및 예측 로직 구현
-# ----------------------------------------------------
-
-# 기본 루트 엔드포인트
-@app.get("/", summary="루트 엔드포인트")
-def read_root():
-    return {"message": "Welcome to Titanic Survival Prediction API! Check /docs for details."}
-
-# 예측 엔드포인트 (POST)
-@app.post("/predict", summary="생존 확률 예측")
-def predict(input_data: PredictionInput):
-    """
-    성별(sex)과 나이(age)를 입력받아 생존 확률을 예측합니다.
-    """
+@app.get("/predict", response_class=HTMLResponse)
+async def predict(request: Request, date: str = Query(...)):
+    """날짜를 받아 예측 결과를 보여주는 페이지"""
     try:
-        # 1. 입력 데이터 전처리 (성별 인코딩)
-        input_sex = input_data.sex.lower()
-        
-        # 유효성 검사 (label_encoder에 정의된 값인지 확인)
-        if input_sex not in label_encoder.classes_:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"유효하지 않은 성별 값입니다: {input_data.sex}. 'male' 또는 'female'을 입력해주세요."
-            )
-            
-        # LabelEncoder를 사용하여 'male' 또는 'female'을 숫자로 변환 (e.g., male=1, female=0)
-        sex_encoded = label_encoder.transform([input_sex])[0]
-        
-        # 2. 모델 예측 수행
-        # numpy 배열 형태로 입력 데이터를 준비: [[성별_인코딩, 나이]]
-        X_input = np.array([[sex_encoded, input_data.age]])
-        
-        # 생존 확률 (1일 확률) 추출
-        # predict_proba의 두 번째 요소 ([0][1])가 생존 확률을 나타냅니다.
-        survival_prob = model.predict_proba(X_input)[0][1]
+        if not date:
+            return templates.TemplateResponse("index.html", {
+                "request": request, 
+                "error": "날짜를 선택하세요.", 
+                "available_dates": available_dates
+            })
 
-        # 3. 결과 반환
-        return {
-            "sex": input_data.sex,
-            "age": input_data.age,
-            "survival_probability": round(survival_prob, 3)
-        }
-        
-    except HTTPException as e:
-        # 400 에러 발생 시 그대로 반환
-        raise e
+        future_date = pd.to_datetime(date)
+
+        # 날짜 범위 체크
+        if future_date < min_date or future_date > max_date:
+            error_msg = f"예측 가능한 날짜 범위는 {min_date.date()} ~ {max_date.date()}입니다."
+            return templates.TemplateResponse("index.html", {
+                "request": request, 
+                "error": error_msg, 
+                "available_dates": available_dates
+            })
+
+        # 예측 수행
+        prediction = forecast[forecast["ds"].dt.date == future_date.date()]
+        if prediction.empty:
+            return templates.TemplateResponse("index.html", {
+                "request": request, 
+                "error": "해당 날짜에 대한 예측 데이터가 없습니다.", 
+                "available_dates": available_dates
+            })
+
+        # 결과 추출
+        predicted_temp = round(prediction["yhat"].values[0], 2)
+        lower_bound = round(prediction["yhat_lower"].values[0], 2)
+        upper_bound = round(prediction["yhat_upper"].values[0], 2)
+
+        # 실제값 확인
+        if future_date <= actual_data_last_date:
+            actual_temp = round(prediction["y"].values[0], 2)
+        else:
+            actual_temp = "N/A"
+
+        return templates.TemplateResponse("index.html", {
+            "request": request,
+            "selected_date": date,
+            "predicted_temp": predicted_temp,
+            "lower_bound": lower_bound,
+            "upper_bound": upper_bound,
+            "actual_temp": actual_temp,
+            "available_dates": available_dates
+        })
+
     except Exception as e:
-        # 그 외 내부 오류 발생 시 500 에러 반환
-        print(f"예측 중 오류 발생: {e}")
-        raise HTTPException(status_code=500, detail="예측 중 서버 내부 오류가 발생했습니다.")
+        return templates.TemplateResponse("index.html", {
+            "request": request, 
+            "error": str(e), 
+            "available_dates": available_dates
+        })
 
-
-# ----------------------------------------------------
-# 5. 서버 실행 가이드 (터미널 명령어)
-# ----------------------------------------------------
-# uvicorn main:app --reload --host 0.0.0.0 --port 8080
+if __name__ == "__main__":
+    # 로컬 테스트 용
+    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)
